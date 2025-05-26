@@ -882,6 +882,201 @@ def test_converse_stream_with_content_tool_call(
     BOTO3_VERSION < (1, 35, 56), reason="ConverseStream API not available"
 )
 @pytest.mark.vcr()
+def test_converse_stream_tool_call_parsing_errors(
+    span_exporter, log_exporter, bedrock_runtime_client
+):
+    # pylint:disable=too-many-locals,too-many-statements
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "text": "Use the get_cities_list tool to provide exactly 10 popular tourist cities in Japan. Call the tool with a cities array containing: Tokyo, Osaka, Kyoto, Hiroshima, Nara, Yokohama, Sapporo, Fukuoka, Sendai, and Nagoya"
+                }
+            ],
+        }
+    ]
+
+    tool_config = {
+        "tools": [
+            {
+                "toolSpec": {
+                    "name": "get_cities_list",
+                    "description": "Get a list of cities",
+                    "inputSchema": {
+                        "json": {
+                            "type": "object",
+                            "properties": {
+                                "cities": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                }
+                            },
+                        }
+                    },
+                }
+            }
+        ]
+    }
+
+    llm_model_value = "anthropic.claude-3-sonnet-20240229-v1:0"
+    response_0 = bedrock_runtime_client.converse_stream(
+        messages=messages, modelId=llm_model_value, toolConfig=tool_config
+    )
+
+    res = ""
+    # Process the streaming response - error occurs here
+    for chunk in response_0["stream"]:
+        if "contentBlockDelta" in chunk:
+            delta = chunk["contentBlockDelta"]["delta"]
+            if "toolUse" in delta:
+                res += delta["toolUse"].get("input")
+
+    # Parse the output and print it
+    print(json.loads(res))
+
+    # consume the stream and assemble it as the non-streaming version
+    response_0_message = _rebuild_stream_message(response_0)
+
+    tool_requests_ids = [
+        request["toolUse"]["toolUseId"]
+        for request in response_0_message["content"]
+        if "toolUse" in request
+    ]
+    assert len(tool_requests_ids) == 1
+
+    tool_call_result = {
+        "role": "user",
+        "content": [
+            {
+                "toolResult": {
+                    "content": [
+                        {"json": {"weather": "50 degrees and raining"}}
+                    ],
+                    "toolUseId": tool_requests_ids[0],
+                },
+            },
+            {
+                "toolResult": {
+                    "content": [{"json": {"weather": "70 degrees and sunny"}}],
+                    "toolUseId": tool_requests_ids[1],
+                },
+            },
+        ],
+    }
+
+    response_0_message.pop("stopReason")
+    messages.append(response_0_message)
+    messages.append(tool_call_result)
+
+    response_1 = bedrock_runtime_client.converse_stream(
+        messages=messages,
+        modelId=llm_model_value,
+        toolConfig=tool_config,
+    )
+
+    # consume the stream to have it traced
+    _ = _rebuild_stream_message(response_1)
+
+    (span_0, span_1) = span_exporter.get_finished_spans()
+    assert_stream_completion_attributes(
+        span_0,
+        llm_model_value,
+        input_tokens=mock.ANY,
+        output_tokens=mock.ANY,
+        finish_reason=("tool_use",),
+        operation_name="chat",
+    )
+    assert_stream_completion_attributes(
+        span_1,
+        llm_model_value,
+        input_tokens=mock.ANY,
+        output_tokens=mock.ANY,
+        finish_reason=("end_turn",),
+        operation_name="chat",
+    )
+
+    logs = log_exporter.get_finished_logs()
+    assert len(logs) == 8
+
+    # first span
+    user_content = {}
+    assert_message_in_logs(
+        logs[0], "gen_ai.user.message", user_content, span_0
+    )
+
+    function_call_0 = {"name": "get_current_weather"}
+    function_call_1 = {"name": "get_current_weather"}
+    choice_body = {
+        "index": 0,
+        "finish_reason": "tool_use",
+        "message": {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": tool_requests_ids[0],
+                    "type": "function",
+                    "function": function_call_0,
+                },
+                {
+                    "id": tool_requests_ids[1],
+                    "type": "function",
+                    "function": function_call_1,
+                },
+            ],
+        },
+    }
+    assert_message_in_logs(logs[1], "gen_ai.choice", choice_body, span_0)
+
+    # second span
+    assert_message_in_logs(
+        logs[2], "gen_ai.user.message", user_content, span_1
+    )
+    assistant_body = response_0_message
+    assistant_body["tool_calls"] = choice_body["message"]["tool_calls"]
+    assistant_body.pop("role")
+    assistant_body.pop("content")
+    assert_message_in_logs(
+        logs[3],
+        "gen_ai.assistant.message",
+        assistant_body,
+        span_1,
+    )
+    tool_message_0 = {
+        "id": tool_requests_ids[0],
+        "content": None,
+    }
+    assert_message_in_logs(
+        logs[4], "gen_ai.tool.message", tool_message_0, span_1
+    )
+    tool_message_1 = {
+        "id": tool_requests_ids[1],
+        "content": None,
+    }
+    assert_message_in_logs(
+        logs[5], "gen_ai.tool.message", tool_message_1, span_1
+    )
+
+    user_message_body = tool_call_result
+    user_message_body.pop("role")
+    user_message_body.pop("content")
+    assert_message_in_logs(
+        logs[6], "gen_ai.user.message", user_message_body, span_1
+    )
+    choice_body = {
+        "index": 0,
+        "finish_reason": "end_turn",
+        "message": {
+            "role": "assistant",
+        },
+    }
+    assert_message_in_logs(logs[7], "gen_ai.choice", choice_body, span_1)
+
+
+@pytest.mark.skipif(
+    BOTO3_VERSION < (1, 35, 56), reason="ConverseStream API not available"
+)
+@pytest.mark.vcr()
 def test_converse_stream_no_content(
     span_exporter,
     log_exporter,
