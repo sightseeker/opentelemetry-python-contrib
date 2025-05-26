@@ -883,7 +883,7 @@ def test_converse_stream_with_content_tool_call(
 )
 @pytest.mark.vcr()
 def test_converse_stream_tool_call_parsing_errors(
-    span_exporter, log_exporter, bedrock_runtime_client
+    span_exporter, log_exporter, bedrock_runtime_client, instrument_no_content
 ):
     # pylint:disable=too-many-locals,too-many-statements
     messages = [
